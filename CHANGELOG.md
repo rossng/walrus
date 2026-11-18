@@ -27,6 +27,9 @@ Released YYYY-MM-DD.
   they point into, because gimli can't write them.
 * The GC pass looks up the type of each local as it visits the local, instead
   of collecting every local use in a function into a list first.
+* With the `parallel` feature, the GC pass finds the items that each local
+  function references in parallel, before it walks the used items. This
+  visits unused functions too, so it uses more CPU time but less wall time.
 
 ### Deprecated
 
