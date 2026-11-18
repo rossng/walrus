@@ -4,7 +4,7 @@ use crate::map::IdHashSet;
 use crate::ty::HeapType;
 use crate::{ConstExpr, Data, DataId, DataKind, Element, ExportItem, Function};
 use crate::{ElementId, ElementItems, ElementKind, Module, RefType, Tag, TagId, Type, TypeId};
-use crate::{FunctionId, FunctionKind, Global, GlobalId};
+use crate::{FunctionId, FunctionKind, Global, GlobalId, LocalFunction};
 use crate::{GlobalKind, Memory, MemoryId, ModuleLocals, Table, TableId};
 
 /// Set of all root used items in a wasm module.
@@ -205,6 +205,25 @@ impl Used {
             section.add_gc_roots(&mut stack);
         }
 
+        // Finding what a function references means visiting every
+        // instruction, so do that for all functions in parallel up front.
+        #[cfg(feature = "parallel")]
+        let refs = {
+            use rayon::prelude::*;
+            let refs = module
+                .funcs
+                .par_iter_local()
+                .map(|(id, func)| (id, FuncRefs::new(func, &module.locals)))
+                .collect::<Vec<_>>();
+            let len = refs.iter().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
+            let mut by_index = Vec::new();
+            by_index.resize_with(len, || None);
+            for (id, refs) in refs {
+                by_index[id.index()] = Some(refs);
+            }
+            by_index
+        };
+
         // Iteratively visit all items until our stack is empty
         while !stack.funcs.is_empty()
             || !stack.tables.is_empty()
@@ -219,12 +238,12 @@ impl Used {
                 stack.used.types.insert(func.ty());
 
                 match &func.kind {
-                    FunctionKind::Local(func) => {
-                        let mut visitor = UsedVisitor {
-                            stack: &mut stack,
-                            locals: &module.locals,
-                        };
-                        dfs_in_order(&mut visitor, func, func.entry_block());
+                    FunctionKind::Local(_func) => {
+                        #[cfg(feature = "parallel")]
+                        let func_refs = refs[f.index()].as_ref().unwrap();
+                        #[cfg(not(feature = "parallel"))]
+                        let func_refs = &FuncRefs::new(_func, &module.locals);
+                        func_refs.push(&mut stack);
                     }
                     FunctionKind::Import(_) => {}
                     FunctionKind::Uninitialized(_) => unreachable!(),
@@ -346,48 +365,124 @@ impl Used {
     }
 }
 
-struct UsedVisitor<'a> {
-    stack: &'a mut Roots,
+/// The items that a function's instructions reference, each listed once.
+#[derive(Default)]
+struct FuncRefs {
+    funcs: Vec<FunctionId>,
+    tables: Vec<TableId>,
+    memories: Vec<MemoryId>,
+    globals: Vec<GlobalId>,
+    types: Vec<TypeId>,
+    datas: Vec<DataId>,
+    elements: Vec<ElementId>,
+    tags: Vec<TagId>,
+}
+
+impl FuncRefs {
+    fn new(func: &LocalFunction, locals: &ModuleLocals) -> FuncRefs {
+        let mut visitor = RefsVisitor {
+            refs: FuncRefs::default(),
+            locals,
+        };
+        dfs_in_order(&mut visitor, func, func.entry_block());
+        let mut refs = visitor.refs;
+        fn dedup<T: Ord>(ids: &mut Vec<T>) {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        dedup(&mut refs.funcs);
+        dedup(&mut refs.tables);
+        dedup(&mut refs.memories);
+        dedup(&mut refs.globals);
+        dedup(&mut refs.types);
+        dedup(&mut refs.datas);
+        dedup(&mut refs.elements);
+        dedup(&mut refs.tags);
+        refs
+    }
+
+    fn push(&self, stack: &mut Roots) {
+        for &f in &self.funcs {
+            stack.push_func(f);
+        }
+        for &t in &self.tables {
+            stack.push_table(t);
+        }
+        for &m in &self.memories {
+            stack.push_memory(m);
+        }
+        for &g in &self.globals {
+            stack.push_global(g);
+        }
+        for &t in &self.types {
+            stack.used.types.insert(t);
+        }
+        for &d in &self.datas {
+            stack.push_data(d);
+        }
+        for &e in &self.elements {
+            stack.push_element(e);
+        }
+        for &t in &self.tags {
+            stack.push_tag(t);
+        }
+    }
+
+    fn push_ref_type(&mut self, ref_type: &RefType) {
+        if let HeapType::Concrete(type_id) | HeapType::Exact(type_id) = ref_type.heap_type {
+            self.types.push(type_id);
+        }
+    }
+
+    fn push_val_type(&mut self, val_type: &crate::ValType) {
+        if let crate::ValType::Ref(ref_type) = val_type {
+            self.push_ref_type(ref_type);
+        }
+    }
+}
+
+struct RefsVisitor<'a> {
+    refs: FuncRefs,
     locals: &'a ModuleLocals,
 }
 
-impl<'expr> Visitor<'expr> for UsedVisitor<'_> {
+impl<'expr> Visitor<'expr> for RefsVisitor<'_> {
     fn visit_function_id(&mut self, &func: &FunctionId) {
-        self.stack.push_func(func);
+        self.refs.funcs.push(func);
     }
 
     fn visit_memory_id(&mut self, &m: &MemoryId) {
-        self.stack.push_memory(m);
+        self.refs.memories.push(m);
     }
 
     fn visit_global_id(&mut self, &g: &GlobalId) {
-        self.stack.push_global(g);
+        self.refs.globals.push(g);
     }
 
     fn visit_table_id(&mut self, &t: &TableId) {
-        self.stack.push_table(t);
+        self.refs.tables.push(t);
     }
 
     fn visit_type_id(&mut self, &t: &TypeId) {
-        self.stack.used.types.insert(t);
+        self.refs.types.push(t);
     }
 
     // Non-argument locals may have concrete reference types, which must
     // survive GC.
     fn visit_local_id(&mut self, &id: &LocalId) {
-        mark_val_type_used(&mut self.stack.used, &self.locals.get(id).ty());
+        self.refs.push_val_type(&self.locals.get(id).ty());
     }
 
     fn visit_data_id(&mut self, &d: &DataId) {
-        self.stack.push_data(d);
+        self.refs.datas.push(d);
     }
 
     fn visit_element_id(&mut self, &e: &ElementId) {
-        self.stack.push_element(e);
+        self.refs.elements.push(e);
     }
 
     fn visit_tag_id(&mut self, &tag: &TagId) {
-        self.stack.push_tag(tag);
+        self.refs.tags.push(tag);
     }
 
     // RefType/ValType fields on Select and RefNull are still
@@ -395,12 +490,12 @@ impl<'expr> Visitor<'expr> for UsedVisitor<'_> {
 
     fn visit_select(&mut self, instr: &Select) {
         if let Some(ty) = &instr.ty {
-            mark_val_type_used(&mut self.stack.used, ty);
+            self.refs.push_val_type(ty);
         }
     }
 
     fn visit_ref_null(&mut self, instr: &RefNull) {
-        mark_ref_type_used(&mut self.stack.used, &instr.ty);
+        self.refs.push_ref_type(&instr.ty);
     }
 }
 
