@@ -5,7 +5,7 @@ use crate::ty::HeapType;
 use crate::{ConstExpr, Data, DataId, DataKind, Element, ExportItem, Function};
 use crate::{ElementId, ElementItems, ElementKind, Module, RefType, Tag, TagId, Type, TypeId};
 use crate::{FunctionId, FunctionKind, Global, GlobalId};
-use crate::{GlobalKind, Memory, MemoryId, Table, TableId};
+use crate::{GlobalKind, Memory, MemoryId, ModuleLocals, Table, TableId};
 
 /// Set of all root used items in a wasm module.
 #[derive(Debug, Default)]
@@ -222,15 +222,9 @@ impl Used {
                     FunctionKind::Local(func) => {
                         let mut visitor = UsedVisitor {
                             stack: &mut stack,
-                            local_ids: Vec::new(),
+                            locals: &module.locals,
                         };
                         dfs_in_order(&mut visitor, func, func.entry_block());
-                        // Mark types referenced by used locals (non-arg locals
-                        // may have concrete ref types that need to survive GC).
-                        for local_id in visitor.local_ids {
-                            let ty = module.locals.get(local_id).ty();
-                            mark_val_type_used(&mut stack.used, &ty);
-                        }
                     }
                     FunctionKind::Import(_) => {}
                     FunctionKind::Uninitialized(_) => unreachable!(),
@@ -354,7 +348,7 @@ impl Used {
 
 struct UsedVisitor<'a> {
     stack: &'a mut Roots,
-    local_ids: Vec<LocalId>,
+    locals: &'a ModuleLocals,
 }
 
 impl<'expr> Visitor<'expr> for UsedVisitor<'_> {
@@ -378,8 +372,10 @@ impl<'expr> Visitor<'expr> for UsedVisitor<'_> {
         self.stack.used.types.insert(t);
     }
 
+    // Non-argument locals may have concrete reference types, which must
+    // survive GC.
     fn visit_local_id(&mut self, &id: &LocalId) {
-        self.local_ids.push(id);
+        mark_val_type_used(&mut self.stack.used, &self.locals.get(id).ty());
     }
 
     fn visit_data_id(&mut self, &d: &DataId) {

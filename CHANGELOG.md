@@ -25,6 +25,8 @@ Released YYYY-MM-DD.
 * With `generate_dwarf`, `DW_AT_macros`, `DW_AT_macro_info` and
   `DW_AT_GNU_macros` are removed. walrus never emitted the macro sections
   they point into, because gimli can't write them.
+* The GC pass looks up the type of each local as it visits the local, instead
+  of collecting every local use in a function into a list first.
 
 ### Deprecated
 
